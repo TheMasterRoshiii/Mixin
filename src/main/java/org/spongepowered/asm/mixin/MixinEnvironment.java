@@ -265,6 +265,14 @@ public final class MixinEnvironment implements ITokenProvider {
         DEBUG_VERBOSE(Option.DEBUG_ALL, "verbose"),
         
         /**
+         * Enable verbose logging of Kotlin-specific mixin handling,
+         * such as renaming of companion object, {@code @JvmStatic}
+         * and {@code @JvmField} members, elevates those messages to
+         * INFO level
+         */
+        DEBUG_KOTLIN(Option.DEBUG_ALL, "kotlin"),
+        
+        /**
          * Elevates failed injections to an error condition, see
          * {@link Inject#expect} for details
          */

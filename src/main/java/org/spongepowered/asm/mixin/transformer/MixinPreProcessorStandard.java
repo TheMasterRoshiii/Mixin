@@ -28,6 +28,7 @@ import java.lang.annotation.Annotation;
 import java.util.Iterator;
 
 import org.spongepowered.asm.logging.ILogger;
+import org.spongepowered.asm.logging.Level;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
@@ -64,6 +65,7 @@ import org.spongepowered.asm.util.Annotations;
 import org.spongepowered.asm.util.Bytecode;
 import org.spongepowered.asm.util.Bytecode.Visibility;
 import org.spongepowered.asm.util.Constants;
+import org.spongepowered.asm.util.KotlinUtil;
 import org.spongepowered.asm.util.perf.Profiler;
 import org.spongepowered.asm.util.perf.Profiler.Section;
 import org.spongepowered.asm.util.throwables.SyntheticBridgeException;
@@ -151,15 +153,23 @@ class MixinPreProcessorStandard {
     protected final ActivityStack activities = new ActivityStack();
 
     private final boolean verboseLogging, strictUnique;
-    
+
+    /**
+     * True if the mixin class was compiled from Kotlin source, in which
+     * case compiler-generated members (companion objects, @JvmStatic and
+     * @JvmField members) need special handling to be mergeable
+     */
+    private final boolean isKotlin;
+
     private boolean prepared, attached;
-    
+
     MixinPreProcessorStandard(MixinInfo mixin, MixinClassNode classNode) {
         this.mixin = mixin;
         this.classNode = classNode;
         this.env = mixin.getParent().getEnvironment();
         this.verboseLogging = this.env.getOption(Option.DEBUG_VERBOSE);
         this.strictUnique = this.env.getOption(Option.DEBUG_UNIQUE);
+        this.isKotlin = KotlinUtil.isKotlinClass(classNode);
     }
 
     /**
@@ -329,7 +339,11 @@ class MixinPreProcessorStandard {
                 iter.remove();
                 continue;
             }
-            
+
+            if (this.isKotlin && this.isKotlinStaticArtifact(mixinMethod)) {
+                this.renameKotlinStaticMethod(context, mixinMethod);
+            }
+
             if (this.attachInjectorMethod(context, mixinMethod)) {
                 context.addMixinMethod(mixinMethod);
                 continue;
@@ -696,6 +710,14 @@ class MixinPreProcessorStandard {
                 && !Bytecode.hasFlag(field, Opcodes.ACC_PRIVATE)
                 && !Bytecode.hasFlag(field, Opcodes.ACC_SYNTHETIC)
                 && shadow == null) {
+            if (this.isKotlin) {
+                // The Kotlin compiler generates public static fields for
+                // companion objects (Companion) and @JvmField members.
+                // Rename them to unique names so they can be safely
+                // merged without clashing with the target class.
+                this.renameKotlinStaticField(context, field);
+                return true;
+            }
             throw new InvalidMixinException(context, String.format("Mixin %s contains non-private static field %s:%s",
                     context, field.name, field.desc));
         }
@@ -722,6 +744,101 @@ class MixinPreProcessorStandard {
         }
         
         return true;
+    }
+
+    /**
+     * Determine whether the supplied method is a compiler-generated
+     * static member of a Kotlin mixin, for example a {@code @JvmStatic}
+     * companion member. Such members are public and static, which is
+     * illegal in a mixin, so they are renamed to unique members which
+     * are safe to merge. Members which carry mixin annotations are
+     * excluded because they are processed by their own machinery.
+     *
+     * @param mixinMethod method to inspect
+     * @return true if the method is a Kotlin-generated static member
+     */
+    private boolean isKotlinStaticArtifact(MixinMethodNode mixinMethod) {
+        return Bytecode.hasFlag(mixinMethod, Opcodes.ACC_STATIC)
+                && !Bytecode.hasFlag(mixinMethod, Opcodes.ACC_PRIVATE)
+                && !Bytecode.hasFlag(mixinMethod, Opcodes.ACC_SYNTHETIC)
+                && !mixinMethod.isInjector()
+                && mixinMethod.getVisibleAnnotation(Shadow.class) == null
+                && mixinMethod.getVisibleAnnotation(Overwrite.class) == null
+                && mixinMethod.getVisibleAnnotation(Accessor.class) == null
+                && mixinMethod.getVisibleAnnotation(Invoker.class) == null;
+    }
+
+    /**
+     * Rename a compiler-generated static method (for example a
+     * {@code @JvmStatic} companion member) to a unique name and
+     * demote it to a private (or, for interface mixins, synthetic)
+     * member so that it can be merged into the target class without
+     * tripping static binding checks. References to the method within
+     * the mixin are rewritten by the transform phase.
+     *
+     * @param context mixin target context
+     * @param mixinMethod method to rename
+     */
+    private void renameKotlinStaticMethod(MixinTargetContext context, MixinMethodNode mixinMethod) {
+        Method method = this.mixin.getClassInfo().findMethod(mixinMethod, ClassInfo.INCLUDE_ALL);
+        if (method == null) {
+            return;
+        }
+
+        String originalName = mixinMethod.name;
+        String uniqueName = context.getUniqueName(mixinMethod, false);
+        mixinMethod.name = method.conform(uniqueName);
+        if (this.mixin.getClassInfo().isInterface()) {
+            // Interface members are implicitly public, so instead of
+            // demoting visibility we mark the member synthetic, which
+            // exempts it from static binding checks
+            mixinMethod.access |= Opcodes.ACC_SYNTHETIC;
+        } else {
+            Bytecode.setVisibility(mixinMethod, Visibility.PRIVATE);
+        }
+
+        MixinPreProcessorStandard.logger.log(this.getKotlinLogLevel(),
+                "Renamed Kotlin static method {}{} to {} in {}", originalName, mixinMethod.desc, uniqueName, this.mixin);
+    }
+
+    /**
+     * Rename a compiler-generated static field (the {@code Companion}
+     * field of a companion object or an {@code @JvmField} member) to
+     * a unique name and demote it to private so that it can be merged
+     * into the target class without tripping static binding checks.
+     * The companion object class itself is copied into the target by
+     * the inner class generator and its references are remapped, so
+     * the renamed field points at the remapped companion class.
+     *
+     * @param context mixin target context
+     * @param field field to rename
+     */
+    private void renameKotlinStaticField(MixinTargetContext context, FieldNode field) {
+        Field fieldInfo = this.mixin.getClassInfo().findField(field);
+        if (fieldInfo == null) {
+            return;
+        }
+
+        String originalName = field.name;
+        String uniqueName = context.getUniqueName(field);
+        field.name = fieldInfo.renameTo(uniqueName);
+        if (!this.mixin.getClassInfo().isInterface()) {
+            Bytecode.setVisibility(field, Visibility.PRIVATE);
+        }
+
+        MixinPreProcessorStandard.logger.log(this.getKotlinLogLevel(),
+                "Renamed Kotlin static field {}{} to {} in {}", originalName, field.desc, uniqueName, this.mixin);
+    }
+
+    /**
+     * Get the log level for Kotlin handling messages, elevates
+     * them to INFO level when {@link Option#DEBUG_KOTLIN} is
+     * enabled so that they are visible by default
+     *
+     * @return log level for Kotlin messages
+     */
+    private Level getKotlinLogLevel() {
+        return this.env.getOption(Option.DEBUG_KOTLIN) ? Level.INFO : this.mixin.getLoggingLevel();
     }
 
     /**

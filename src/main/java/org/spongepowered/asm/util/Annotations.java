@@ -775,6 +775,10 @@ public final class Annotations {
         if (annotation.desc.startsWith("L" + Constants.MIXIN_PACKAGE_REF)) {
             return Annotations.mergeableAnnotationPattern.matcher(annotation.desc).matches();
         }
+
+        if (KotlinUtil.isKotlinAnnotation(annotation.desc)) {
+            return false;
+        }
         return true;
     }
     
